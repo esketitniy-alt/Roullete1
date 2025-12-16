@@ -32,12 +32,16 @@ app.use('/api/auth', authRoutes);
 app.use('/api/game', gameRoutes);
 app.use('/api/admin', adminRoutes);
 
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 // Подключение к БД
 connectDB();
 
-// ==================== ИГРОВАЯ ЛОГИКА ====================
+// ==================== КОНФИГУРАЦИЯ РУЛЕТКИ ====================
 
-// Конфигурация рулетки - 15 секторов
 const SECTORS = [
   { number: 0, color: 'green' },
   { number: 1, color: 'red' },
@@ -56,39 +60,63 @@ const SECTORS = [
   { number: 14, color: 'black' }
 ];
 
-const MULTIPLIERS = {
-  red: 2,
-  black: 2,
-  green: 14
-};
-
+const MULTIPLIERS = { red: 2, black: 2, green: 14 };
 const MIN_BET = 10;
 const MAX_BET = 10000;
-const BETTING_TIME = 25000; // 25 секунд на ставки
-const SPIN_TIME = 8000; // 8 секунд кручение
+const BETTING_TIME = 25000;
+const SPIN_TIME = 8000;
+const RESULT_TIME = 5000;
 
-// Состояние игры
+// ==================== СОСТОЯНИЕ ИГРЫ ====================
+
 let gameState = {
   currentRoundId: 1,
-  phase: 'betting', // 'betting', 'spinning', 'result'
+  phase: 'betting',
   timeLeft: BETTING_TIME / 1000,
   currentBets: [],
   lastResults: [],
-  winningSector: null
+  winningSector: null,
+  winningSectorIndex: null
 };
 
-// Онлайн пользователи
 const onlineUsers = new Map();
+const userSockets = new Map();
 
-// Аутентификация сокета
+// ==================== ИНИЦИАЛИЗАЦИЯ ====================
+
+const initializeGame = async () => {
+  try {
+    const lastRound = await Round.findOne().sort({ roundId: -1 });
+    if (lastRound) {
+      gameState.currentRoundId = lastRound.roundId + 1;
+    }
+    
+    const lastResults = await Round.find({ status: 'completed' })
+      .sort({ createdAt: -1 })
+      .limit(15);
+    
+    gameState.lastResults = lastResults.map(r => ({
+      sector: r.result.sector,
+      color: r.result.color
+    }));
+    
+    console.log(`🎮 Игра инициализирована. Текущий раунд: ${gameState.currentRoundId}`);
+  } catch (error) {
+    console.error('Ошибка инициализации:', error);
+  }
+};
+
+// ==================== АУТЕНТИФИКАЦИЯ СОКЕТА ====================
+
 const authenticateSocket = async (socket, next) => {
   try {
     const token = socket.handshake.auth.token;
     if (token) {
-      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret-key');
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'super-secret-key-12345');
       const user = await User.findById(decoded.id).select('-password');
       if (user) {
         socket.user = user;
+        socket.odId = user._id.toString();
       }
     }
     next();
@@ -99,9 +127,10 @@ const authenticateSocket = async (socket, next) => {
 
 io.use(authenticateSocket);
 
-// Socket.IO обработчики
+// ==================== SOCKET.IO ОБРАБОТЧИКИ ====================
+
 io.on('connection', (socket) => {
-  console.log(`🔌 Подключение: ${socket.id}`);
+  console.log(`🔌 Подключение: ${socket.id}${socket.user ? ` (${socket.user.username})` : ' (гость)'}`);
   
   // Отправляем текущее состояние игры
   socket.emit('gameState', {
@@ -114,14 +143,18 @@ io.on('connection', (socket) => {
   
   // Регистрация пользователя
   if (socket.user) {
-    onlineUsers.set(socket.user._id.toString(), {
-      odId: socket.id,
+    onlineUsers.set(socket.odId, {
+      odId: socket.odId,
       username: socket.user.username
     });
-    io.emit('onlineCount', onlineUsers.size);
+    userSockets.set(socket.odId, socket);
+    socket.emit('balanceUpdate', socket.user.balance);
   }
   
-  // Размещение ставки
+  io.emit('onlineCount', onlineUsers.size);
+  
+  // ==================== РАЗМЕЩЕНИЕ СТАВКИ ====================
+  
   socket.on('placeBet', async (data) => {
     try {
       if (!socket.user) {
@@ -136,23 +169,19 @@ io.on('connection', (socket) => {
       
       const { color, amount } = data;
       
-      // Валидация цвета
       if (!['red', 'black', 'green'].includes(color)) {
         socket.emit('error', { message: 'Неверный цвет' });
         return;
       }
       
-      // Валидация суммы
       const betAmount = parseInt(amount);
       if (isNaN(betAmount) || betAmount < MIN_BET || betAmount > MAX_BET) {
         socket.emit('error', { message: `Ставка должна быть от ${MIN_BET} до ${MAX_BET}` });
         return;
       }
       
-      // Проверяем количество цветов, на которые уже поставил пользователь
-      const userBets = gameState.currentBets.filter(
-        b => b.odId === socket.user._id.toString()
-      );
+      // Проверяем количество цветов (максимум 2)
+      const userBets = gameState.currentBets.filter(b => b.odId === socket.odId);
       const userColors = [...new Set(userBets.map(b => b.color))];
       
       if (!userColors.includes(color) && userColors.length >= 2) {
@@ -161,7 +190,12 @@ io.on('connection', (socket) => {
       }
       
       // Проверяем баланс
-      const user = await User.findById(socket.user._id);
+      const user = await User.findById(socket.odId);
+      if (!user) {
+        socket.emit('error', { message: 'Пользователь не найден' });
+        return;
+      }
+      
       if (user.balance < betAmount) {
         socket.emit('error', { message: 'Недостаточно средств' });
         return;
@@ -171,7 +205,7 @@ io.on('connection', (socket) => {
       user.balance -= betAmount;
       await user.save();
       
-      // Создаем ставку
+      // Создаем ставку в БД
       const bet = await Bet.create({
         user: user._id,
         username: user.username,
@@ -183,7 +217,7 @@ io.on('connection', (socket) => {
       // Добавляем в текущие ставки
       const betData = {
         odId: user._id.toString(),
-        odId: bet._id.toString(),
+        betId: bet._id.toString(),
         username: user.username,
         color,
         amount: betAmount
@@ -197,7 +231,13 @@ io.on('connection', (socket) => {
       // Отправляем всем обновленные ставки
       io.emit('betsUpdate', gameState.currentBets);
       
-      socket.emit('betPlaced', { message: 'Ставка принята', bet: betData });
+      const colorName = color === 'red' ? 'красное' : color === 'black' ? 'черное' : 'зеленое';
+      socket.emit('betPlaced', { 
+        message: `Ставка ${betAmount} на ${colorName} принята`,
+        bet: betData 
+      });
+      
+      console.log(`💰 ${user.username} поставил ${betAmount} на ${color}`);
       
     } catch (error) {
       console.error('Ошибка ставки:', error);
@@ -208,25 +248,27 @@ io.on('connection', (socket) => {
   // Запрос баланса
   socket.on('getBalance', async () => {
     if (socket.user) {
-      const user = await User.findById(socket.user._id);
-      socket.emit('balanceUpdate', user.balance);
+      const user = await User.findById(socket.odId);
+      if (user) {
+        socket.emit('balanceUpdate', user.balance);
+      }
     }
   });
   
   // Отключение
   socket.on('disconnect', () => {
     console.log(`❌ Отключение: ${socket.id}`);
-    if (socket.user) {
-      onlineUsers.delete(socket.user._id.toString());
+    if (socket.odId) {
+      onlineUsers.delete(socket.odId);
+      userSockets.delete(socket.odId);
       io.emit('onlineCount', onlineUsers.size);
     }
   });
 });
 
-// ==================== ИГРОВОЙ ЦИКЛ ====================
+// ==================== ИГРОВАЯ ЛОГИКА ====================
 
 const spinRoulette = () => {
-  // Случайный сектор
   const winningSectorIndex = Math.floor(Math.random() * SECTORS.length);
   const winningSector = SECTORS[winningSectorIndex];
   
@@ -240,189 +282,216 @@ const processResults = async (result) => {
   const { sector } = result;
   let totalPayout = 0;
   
-  // Обрабатываем все ставки
+  console.log(`🎯 Результат: ${sector.number} (${sector.color})`);
+  
+  // Группируем ставки по пользователям
+  const userBetsMap = new Map();
+  
   for (const bet of gameState.currentBets) {
-    const betDoc = await Bet.findById(bet.betId);
-    if (!betDoc) continue;
+    if (!userBetsMap.has(bet.odId)) {
+      userBetsMap.set(bet.odId, []);
+    }
+    userBetsMap.get(bet.odId).push(bet);
+  }
+  
+  // Обрабатываем каждого пользователя
+  for (const [odId, bets] of userBetsMap) {
+    let userWinnings = 0;
+    let userWins = 0;
     
-    const won = betDoc.color === sector.color;
-    const payout = won ? betDoc.amount * MULTIPLIERS[sector.color] : 0;
+    for (const bet of bets) {
+      const won = bet.color === sector.color;
+      const payout = won ? bet.amount * MULTIPLIERS[bet.color] : 0;
+      
+      if (won) {
+        userWinnings += payout;
+        userWins++;
+        totalPayout += payout;
+      }
+      
+      // Обновляем ставку в БД
+      await Bet.findOneAndUpdate(
+        { user: odId, roundId: gameState.currentRoundId, color: bet.color, amount: bet.amount },
+        { won, payout }
+      );
+    }
     
-    betDoc.won = won;
-    betDoc.payout = payout;
-    await betDoc.save();
-    
-    if (won) {
-      // Начисляем выигрыш
-      const user = await User.findById(betDoc.user);
-      if (user) {
-        user.balance += payout;
-        user.totalWins += 1;
-        user.totalWon += payout;
-        await user.save();
+    // Обновляем баланс и статистику пользователя
+    const user = await User.findById(odId);
+    if (user) {
+      if (userWinnings > 0) {
+        user.balance += userWinnings;
+      }
+      
+      user.totalBets += bets.length;
+      user.totalWins += userWins;
+      user.totalWagered += bets.reduce((sum, b) => sum + b.amount, 0);
+      user.totalWon += userWinnings;
+      
+      await user.save();
+      
+      // Отправляем обновление баланса
+      const userSocket = userSockets.get(odId);
+      if (userSocket) {
+        userSocket.emit('balanceUpdate', user.balance);
         
-        // Отправляем обновление баланса победителю
-        const userSocket = [...io.sockets.sockets.values()].find(
-          s => s.user?._id.toString() === user._id.toString()
-        );
-        if (userSocket) {
-          userSocket.emit('balanceUpdate', user.balance);
-          userSocket.emit('win', { amount: payout, color: sector.color });
+        if (userWinnings > 0) {
+          userSocket.emit('win', { 
+            amount: userWinnings,
+            message: `Вы выиграли ${userWinnings} монет!`
+          });
         }
       }
     }
-    
-    // Обновляем статистику пользователя
-    const user = await User.findById(betDoc.user);
-    if (user) {
-      user.totalBets += 1;
-      user.totalWagered += betDoc.amount;
-      await user.save();
-    }
-    
-    totalPayout += payout;
+  }
+  
+  // Сохраняем раунд
+  await Round.create({
+    roundId: gameState.currentRoundId,
+    result: {
+      sector: sector.number,
+      color: sector.color
+    },
+    totalBets: gameState.currentBets.reduce((sum, b) => sum + b.amount, 0),
+    totalPayout,
+    status: 'completed',
+    completedAt: new Date()
+  });
+  
+  // Обновляем историю результатов
+  gameState.lastResults.unshift({
+    sector: sector.number,
+    color: sector.color
+  });
+  
+  if (gameState.lastResults.length > 15) {
+    gameState.lastResults.pop();
   }
   
   return totalPayout;
 };
 
-const gameLoop = async () => {
-  // Фаза ставок
-  gameState.phase = 'betting';
-  gameState.currentBets = [];
-  gameState.winningSector = null;
+// ==================== ИГРОВОЙ ЦИКЛ ====================
+
+const startGameLoop = () => {
+  let timer = BETTING_TIME / 1000;
   
-  // Создаем раунд
-  const round = await Round.create({
-    roundId: gameState.currentRoundId,
-    status: 'betting'
-  });
-  
-  io.emit('gameState', {
-    ...gameState,
-    sectors: SECTORS,
-    multipliers: MULTIPLIERS,
-    minBet: MIN_BET,
-    maxBet: MAX_BET
-  });
-  
-  // Таймер ставок
-  let timeLeft = BETTING_TIME / 1000;
-  const bettingInterval = setInterval(() => {
-    timeLeft--;
-    gameState.timeLeft = timeLeft;
-    io.emit('timerUpdate', { phase: 'betting', timeLeft });
+  const gameLoop = async () => {
+    // Фаза ставок
+    gameState.phase = 'betting';
+    gameState.currentBets = [];
+    timer = BETTING_TIME / 1000;
     
-    if (timeLeft <= 0) {
-      clearInterval(bettingInterval);
-    }
-  }, 1000);
-  
-  // Ждем окончания времени ставок
-  await new Promise(resolve => setTimeout(resolve, BETTING_TIME));
-  
-  // Фаза кручения
-  gameState.phase = 'spinning';
-  const spinResult = spinRoulette();
-  gameState.winningSector = spinResult;
-  
-  round.status = 'spinning';
-  await round.save();
-  
-  io.emit('spinStart', {
-    phase: 'spinning',
-    duration: SPIN_TIME,
-    winningSectorIndex: spinResult.sectorIndex
-  });
-  
-  // Ждем окончания анимации
-  await new Promise(resolve => setTimeout(resolve, SPIN_TIME));
-  
-  // Фаза результатов
-  gameState.phase = 'result';
-  
-  const totalPayout = await processResults(spinResult);
-  
-  // Обновляем раунд
-  round.result = {
-    sector: spinResult.sector.number,
-    color: spinResult.sector.color
-  };
-  round.totalBets = gameState.currentBets.reduce((sum, b) => sum + b.amount, 0);
-  round.totalPayout = totalPayout;
-  round.status = 'completed';
-  round.completedAt = new Date();
-  await round.save();
-  
-  // Добавляем в историю
-  gameState.lastResults.unshift({
-    roundId: gameState.currentRoundId,
-    sector: spinResult.sector.number,
-    color: spinResult.sector.color
-  });
-  
-  // Храним только последние 20 результатов
-  if (gameState.lastResults.length > 20) {
-    gameState.lastResults.pop();
-  }
-  
-  io.emit('roundResult', {
-    roundId: gameState.currentRoundId,
-    result: spinResult.sector,
-    lastResults: gameState.lastResults
-  });
-  
-  // Следующий раунд
-  gameState.currentRoundId++;
-  
-  // Пауза перед следующим раундом
-  await new Promise(resolve => setTimeout(resolve, 5000));
-  
-  // Запускаем следующий раунд
-  gameLoop();
-};
-
-// Инициализация игры
-const initGame = async () => {
-  // Получаем последний раунд
-  const lastRound = await Round.findOne().sort({ roundId: -1 });
-  if (lastRound) {
-    gameState.currentRoundId = lastRound.roundId + 1;
-  }
-  
-  // Загружаем последние результаты
-  const lastResults = await Round.find({ status: 'completed' })
-    .sort({ createdAt: -1 })
-    .limit(20);
-  
-  gameState.lastResults = lastResults.map(r => ({
-    roundId: r.roundId,
-    sector: r.result?.sector,
-    color: r.result?.color
-  })).filter(r => r.sector !== undefined);
-  
-  // Запускаем игровой цикл
-  gameLoop();
-};
-
-// Создание админа при первом запуске
-const createDefaultAdmin = async () => {
-  const adminExists = await User.findOne({ isAdmin: true });
-  if (!adminExists) {
-    await User.create({
-      username: 'admin',
-      password: 'admin123',
-      balance: 100000,
-      isAdmin: true
+    console.log(`\n🎰 Раунд #${gameState.currentRoundId} - Приём ставок`);
+    
+    io.emit('gameState', {
+      ...gameState,
+      sectors: SECTORS,
+      multipliers: MULTIPLIERS,
+      minBet: MIN_BET,
+      maxBet: MAX_BET
     });
-    console.log('✅ Создан администратор: admin / admin123');
+    
+    // Таймер ставок
+    const bettingInterval = setInterval(() => {
+      timer--;
+      gameState.timeLeft = timer;
+      
+      io.emit('timerUpdate', {
+        phase: 'betting',
+        timeLeft: timer
+      });
+      
+      if (timer <= 0) {
+        clearInterval(bettingInterval);
+      }
+    }, 1000);
+    
+    // Ждем окончания времени ставок
+    await new Promise(resolve => setTimeout(resolve, BETTING_TIME));
+    clearInterval(bettingInterval);
+    
+    // Фаза кручения
+    gameState.phase = 'spinning';
+    const result = spinRoulette();
+    gameState.winningSectorIndex = result.sectorIndex;
+    gameState.winningSector = result.sector;
+    
+    console.log(`🎡 Кручение... Выпадет: ${result.sector.number} (${result.sector.color})`);
+    
+    io.emit('spinStart', {
+      winningSectorIndex: result.sectorIndex
+    });
+    
+    io.emit('timerUpdate', {
+      phase: 'spinning',
+      timeLeft: SPIN_TIME / 1000
+    });
+    
+    // Ждем окончания анимации
+    await new Promise(resolve => setTimeout(resolve, SPIN_TIME));
+    
+    // Фаза результатов
+    gameState.phase = 'result';
+    
+    const totalPayout = await processResults(result);
+    
+    console.log(`💵 Выплачено: ${totalPayout}`);
+    
+    io.emit('roundResult', {
+      roundId: gameState.currentRoundId,
+      result: result.sector,
+      lastResults: gameState.lastResults
+    });
+    
+    io.emit('timerUpdate', {
+      phase: 'result',
+      timeLeft: RESULT_TIME / 1000
+    });
+    
+    // Ждем показа результата
+    await new Promise(resolve => setTimeout(resolve, RESULT_TIME));
+    
+    // Следующий раунд
+    gameState.currentRoundId++;
+    gameState.winningSectorIndex = null;
+    gameState.winningSector = null;
+    
+    // Запускаем следующий раунд
+    gameLoop();
+  };
+  
+  gameLoop();
+};
+
+// ==================== СОЗДАНИЕ АДМИНА ====================
+
+const createDefaultAdmin = async () => {
+  try {
+    const adminExists = await User.findOne({ username: 'admin' });
+    if (!adminExists) {
+      await User.create({
+        username: 'admin',
+        password: 'admin123',
+        balance: 100000,
+        isAdmin: true
+      });
+      console.log('👑 Создан администратор: admin / admin123');
+    }
+  } catch (error) {
+    console.error('Ошибка создания админа:', error);
   }
 };
 
-// Запуск сервера
+// ==================== ЗАПУСК СЕРВЕРА ====================
+
 const PORT = process.env.PORT || 3000;
+
 httpServer.listen(PORT, async () => {
-  console.log(`🚀 Сервер запущен на порту ${PORT}`);
+  console.log(`\n🚀 Сервер запущен на порту ${PORT}`);
+  console.log(`📡 WebSocket готов к подключениям`);
+  
   await createDefaultAdmin();
-  await initGame();
+  await initializeGame();
+  startGameLoop();
 });
